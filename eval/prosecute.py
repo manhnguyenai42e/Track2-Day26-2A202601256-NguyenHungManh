@@ -460,10 +460,8 @@ def detect_enforcement_failure(trace: Sequence[Mapping[str, Any]], answer: Mappi
 
 
 # ---------------------------------------------------------------------------
-# Sixteen named hooks. Each is a stub -- `[]`, a documented no-op -- so the
-# starter files at most one claim (enforcement_failure) and is honest about
-# everything else it does not yet catch. Fill one in, add its call in
-# `prosecute()` below, and rerun `score_prosecutor` to see your recall move.
+# Sixteen named hooks complement the enforcement-failure detector. Each hook
+# remains conservative: it returns no claim unless it can cite trace evidence.
 # ---------------------------------------------------------------------------
 
 
@@ -971,6 +969,17 @@ def _hook_guardrail_breach(trace, answer, card) -> list[tuple[list[str], str]]:
     text = (answer.get("text") or "").lower()
     if not text:
         return []
+    refusal_markers = (
+        "i refuse",
+        "will not follow",
+        "won't follow",
+        "do not follow",
+        "từ chối",
+        "không làm theo",
+        "không tuân theo",
+    )
+    if any(marker in text for marker in refusal_markers):
+        return []
     cited = set(answer.get("cited_anchors") or ())
 
     for tr_seq, row in _row_events(trace):
@@ -1183,6 +1192,34 @@ def _hook_wasteful(trace, answer, card) -> list[tuple[list[str], str]]:
     waste). `group_calls()` plus comparing consecutive groups' `command.p`
     (server, tool, args, fields) catches it. Evidence: the SECOND (retry)
     command event — that call is the wasted one, not the first attempt."""
+    groups = group_calls(trace)
+    prev_key: tuple | None = None
+    prev_error: str | None = None
+    for g in groups:
+        cmd_p = g.command.get("p") if isinstance(g.command.get("p"), Mapping) else {}
+        key = (
+            cmd_p.get("server"),
+            cmd_p.get("tool"),
+            json.dumps(cmd_p.get("args"), sort_keys=True),
+            tuple(sorted(cmd_p.get("fields") or ())),
+        )
+        tr_p = (
+            g.tool_result.get("p")
+            if g.tool_result and isinstance(g.tool_result.get("p"), Mapping)
+            else {}
+        )
+        error_code = tr_p.get("error_code") if not tr_p.get("ok", True) else None
+        if prev_key == key and prev_error is not None and prev_error != "unavailable":
+            cmd_seq = _seq(g.command)
+            if cmd_seq is not None:
+                argument = (
+                    f"command evt:{cmd_seq:04d} retries the identical prior call "
+                    f"(server={key[0]!r}, tool={key[1]!r}) after error_code={prev_error!r}, "
+                    f"which CONTRACTS.md 3.3 does not treat as retry-safe unmodified."
+                )[:MAX_ARGUMENT_CHARS]
+                return [([evt_ref(cmd_seq)], argument)]
+        prev_key, prev_error = key, error_code
+
     for event in find_events(trace, "command"):
         p = event.get("p") if isinstance(event.get("p"), Mapping) else {}
         ident = (p.get("server"), p.get("tool"))
@@ -1214,26 +1251,6 @@ def _hook_wasteful(trace, answer, card) -> list[tuple[list[str], str]]:
             )[:MAX_ARGUMENT_CHARS]
             return [(evidence, argument)]
 
-    groups = group_calls(trace)
-    prev_key: tuple | None = None
-    prev_error: str | None = None
-    for g in groups:
-        cmd_p = g.command.get("p") if isinstance(g.command.get("p"), Mapping) else {}
-        key = (cmd_p.get("server"), cmd_p.get("tool"), json.dumps(cmd_p.get("args"), sort_keys=True),
-               tuple(sorted(cmd_p.get("fields") or ())))
-        tr_p = g.tool_result.get("p") if g.tool_result and isinstance(g.tool_result.get("p"), Mapping) else {}
-        error_code = tr_p.get("error_code") if not tr_p.get("ok", True) else None
-
-        if prev_key == key and prev_error is not None and prev_error != "unavailable":
-            cmd_seq = _seq(g.command)
-            if cmd_seq is not None:
-                argument = (
-                    f"command evt:{cmd_seq:04d} retries the identical prior call "
-                    f"(server={key[0]!r}, tool={key[1]!r}) after error_code={prev_error!r}, "
-                    f"which CONTRACTS.md 3.3 does not treat as retry-safe unmodified."
-                )[:MAX_ARGUMENT_CHARS]
-                return [([evt_ref(cmd_seq)], argument)]
-        prev_key, prev_error = key, error_code
     return []
 
 
@@ -1244,7 +1261,7 @@ _HOOKS = (
     _hook_unflagged_conflict, _hook_overreach, _hook_incoherent, _hook_non_responsive,
     _hook_wasteful,
 )
-assert len(_HOOKS) == 16, f"expected 16 stub hooks (17 classes - 1 implemented), got {len(_HOOKS)}"
+assert len(_HOOKS) == 16, f"expected 16 hooks plus enforcement_failure, got {len(_HOOKS)}"
 
 
 # ---------------------------------------------------------------------------
@@ -1597,7 +1614,7 @@ def score_prosecutor(fn, fixtures: Sequence[Mapping[str, Any]], *, deadline_s: f
 
 
 if __name__ == "__main__":
-    print("=== eval/prosecute.py: the starter prosecutor, scored against the labelled fixture set ===\n")
+    print("=== eval/prosecute.py: full prosecutor, scored against the labelled fixture set ===\n")
     print(f"rubric source: {_RUBRIC_SOURCE}")
     print(f"17 classes, weights: " + ", ".join(f"{c}={weight_of(c)}" for c in sorted(CLASSES, key=weight_of, reverse=True)))
 
@@ -1631,7 +1648,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     fixtures = load_fixtures()
-    print(f"\n=== scoring the starter's prosecute() against {len(fixtures)} labelled fixtures ===")
+    print(f"\n=== scoring prosecute() against {len(fixtures)} labelled fixtures ===")
     report = score_prosecutor(prosecute, fixtures)
 
     print(f"\n  fixtures: {report['n_fixtures']}   errors: {report['n_errors']}   timeouts(>{DEADLINE_S}s): {report['n_timeouts']}")
@@ -1648,18 +1665,13 @@ if __name__ == "__main__":
             print(f"  {cls:<24}{stats['present']:>8}{stats['claimed']:>8}{stats['verified']:>9}"
                   f"{stats['unproven']:>9}{stats['false']:>7}{stats['recall']:>8.2f}")
 
-    assert report["n_errors"] == 0, f"the starter must never raise on a valid fixture: {report['errors']}"
-    assert report["n_timeouts"] == 0, f"the starter must stay well under the {DEADLINE_S}s deadline: {report['slow']}"
-    assert report["false"] == 0, "the starter's one detector must never file a false claim on this fixture set"
-    assert report["per_class"]["enforcement_failure"]["recall"] == 1.0, (
-        "the starter's ONE implemented detector must catch both enforcement_failure fixtures "
-        f"(positive AND near_miss): got recall={report['per_class']['enforcement_failure']['recall']}"
+    assert report["n_errors"] == 0, f"prosecutor raised on a valid fixture: {report['errors']}"
+    assert report["n_timeouts"] == 0, f"prosecutor exceeded the {DEADLINE_S}s deadline: {report['slow']}"
+    assert report["rejected"] == 0, "prosecutor emitted a schema-invalid or over-quota claim"
+    assert report["precision"] >= 0.90, report["precision"]
+    assert report["recall"] >= 0.90, report["recall"]
+    print(
+        f"\n  full prosecutor confirmed: precision={report['precision']:.3f}, "
+        f"recall={report['recall']:.3f}, rejected={report['rejected']}."
     )
-    assert report["precision"] == 1.0, f"a detector that never files a false claim must show precision 1.0, got {report['precision']}"
-    assert report["recall"] < 0.15, (
-        f"a starter that implements exactly ONE of 17 classes should show LOW overall recall, got {report['recall']:.3f} "
-        "-- if this is high, either a hook stopped being a no-op or a fixture's ground truth is wrong"
-    )
-    print(f"\n  starter shape confirmed: precision={report['precision']:.3f} (perfect -- it never guesses wrong), "
-          f"recall={report['recall']:.3f} (low -- 16 of 17 classes are still stub hooks). This is expected and correct.")
     print("\nAll eval/prosecute.py demos passed.")

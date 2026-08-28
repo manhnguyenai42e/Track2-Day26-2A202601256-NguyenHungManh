@@ -124,6 +124,7 @@ except ImportError:  # pragma: no cover - collaborator file
     _ANCHOR_AVAILABLE = False
 
 from agent.telemetry import RecordingGatewayContext, Telemetry
+from agent.guardrails import scan_for_injected_instructions
 
 # kit.mcp.specs / kit.world.loader are collaborator files (workspace hard rule
 # 2): imported for real per-duel policy (tool costs, default/cheap masks, the
@@ -445,6 +446,8 @@ class Gateway:
         self._admitted_cards: dict[str, dict[str, Any]] = {}
         # Exactly-once is a per-duel invariant, not a per-exchange one.
         self._idempotency_keys: set[str] = set()
+        self._budget_round: int | None = None
+        self._spent_this_round: int = 0
 
     def decide(self, cmd: Command) -> Decision:
         """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3).
@@ -523,8 +526,16 @@ class Gateway:
         # any oversized mask gets the same treatment.
         budgeted = self._budget(routed)
 
+        budget_denial = self._round_budget_denial(budgeted)
+        if budget_denial is not None:
+            return self.deny(cmd, budget_denial)
+
         call = self._to_tool_call(budgeted)
         decision = Decision(verdict="rewrite" if budgeted != cmd else "forward", call=call)
+        authorised_cost = self._estimated_cost(budgeted)
+        if authorised_cost is not None:
+            self._spent_this_round += authorised_cost
+            self._credits_authorised += authorised_cost
         if _looks_like_write(budgeted):
             idem_key = budgeted.headers.get("idempotency-key")
             if isinstance(idem_key, str) and idem_key:
@@ -588,6 +599,13 @@ class Gateway:
             return (
                 f"JOB2 ADMIT: {cmd.server}.{cmd.tool} carries routing data in args; "
                 "replica and route selection must come from authenticated headers"
+            )
+        payload = " ".join(str(value) for value in cmd.args.values())
+        injection = scan_for_injected_instructions(payload)
+        if injection.suspicious:
+            return (
+                f"JOB2 ADMIT: instruction-shaped content matched "
+                f"{injection.matched_patterns!r}; refusing possible prompt injection"
             )
         if cmd.kind == "mcp" and cmd.server == "slides" and cmd.tool == "get_frame":
             if cmd.lease_id is None or cmd.lease_id not in self.ctx.leases:
@@ -751,9 +769,36 @@ class Gateway:
         if not _SPECS_AVAILABLE or (cmd.server, cmd.tool) not in TOOL_SPECS:
             return None
         try:
-            return int(cost_of(self._to_tool_call(cmd)))
+            requested_rows = cmd.args.get("n_rows", cmd.args.get("limit", 1))
+            n_rows = requested_rows if isinstance(requested_rows, int) and requested_rows >= 0 else 1
+            return int(cost_of(self._to_tool_call(cmd), n_rows))
         except (KeyError, TypeError, ValueError):
             return None
+
+    def _round_budget_denial(self, cmd: Command) -> str | None:
+        round_no = int(getattr(self.ctx, "round", 0) or 0)
+        if self._budget_round != round_no:
+            self._budget_round = round_no
+            self._spent_this_round = 0
+        cost = self._estimated_cost(cmd)
+        if cost is None:
+            return None
+        if cost > self.ctx.credits:
+            return (
+                f"JOB4 BUDGET: call costs {cost} credits but only "
+                f"{self.ctx.credits} remain"
+            )
+        if self._spent_this_round + cost > 11:
+            return (
+                f"JOB4 BUDGET: {self._spent_this_round}+{cost} credits would exceed "
+                "the 11-credit round allowance"
+            )
+        self._telemetry.budget_snapshot(
+            round=round_no,
+            credits_left=self.ctx.credits,
+            spent_this_round=self._spent_this_round,
+        )
+        return None
 
     def _is_thin_on_budget(self) -> bool:
         """`True` iff spending further at the current rate risks breaking
@@ -873,7 +918,7 @@ if __name__ == "__main__":
         else:
             raise AssertionError("expected ValueError for an 'answer' action")
 
-    print("\n=== Gateway.decide — the naive starter forwards everything ===\n")
+    print("\n=== Gateway.decide — enforced route/admit/authorize/budget policy ===\n")
     ctx = RecordingGatewayContext(
         act="learner:sv-0401",
         sub="agent:demo-team",
@@ -886,7 +931,14 @@ if __name__ == "__main__":
     )
     assert isinstance(ctx, GatewayContext), "RecordingGatewayContext must structurally satisfy GatewayContext"
     gw = Gateway(ctx)
-    for cmd in demo_commands:
+    gw.note_card(
+        "curriculum-analyst",
+        {"verified": True, "skills": ["which_days_cover"]},
+    )
+    for demo_round, cmd in enumerate(demo_commands, start=1):
+        ctx.round = demo_round
+        if cmd.kind == "a2a":
+            cmd = replace(cmd, headers={**cmd.headers, "aud": f"a2a:{cmd.server}"})
         decision = gw.decide(cmd)
         print(f"  decide({cmd.server}.{cmd.tool}) -> verdict={decision.verdict!r} quarantine={decision.quarantine}")
         assert decision.verdict == "forward"

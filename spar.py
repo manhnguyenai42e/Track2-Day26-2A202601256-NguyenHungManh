@@ -39,6 +39,7 @@ import json
 import random
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -79,6 +80,36 @@ def _load_side(module_root: str):
         base = HERE / "bots" / module_root
     deck = json.loads((base / "deck.json").read_text(encoding="utf8"))
     lineup = json.loads((base / "lineup.json").read_text(encoding="utf8"))["order"]
+    return gw, pr, deck, lineup
+
+
+def _load_bundle_side(bundle_path: str):
+    """Load one sealed submission without leaking its modules into the rival."""
+    path = Path(bundle_path).resolve()
+    if not path.is_file():
+        raise SystemExit(f"bundle not found: {path}")
+    saved = {
+        name: module
+        for name, module in list(sys.modules.items())
+        if name in ("agent", "eval") or name.startswith(("agent.", "eval."))
+    }
+    for name in saved:
+        sys.modules.pop(name, None)
+    sys.path.insert(0, str(path))
+    try:
+        importlib.invalidate_caches()
+        gw = importlib.import_module("agent.gateway").Gateway
+        pr = importlib.import_module("eval.prosecute").prosecute
+        with zipfile.ZipFile(path) as archive:
+            deck = json.loads(archive.read("deck/deck.json"))
+            lineup = json.loads(archive.read("deck/lineup.json"))["order"]
+    finally:
+        sys.path.remove(str(path))
+        for name in list(sys.modules):
+            if name in ("agent", "eval") or name.startswith(("agent.", "eval.")):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved)
+        importlib.invalidate_caches()
     return gw, pr, deck, lineup
 
 
@@ -323,6 +354,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bot", choices=BOTS, default="rookie")
+    ap.add_argument("--you-bundle", help="sealed bundle to use for your side")
+    ap.add_argument("--bot-bundle", help="sealed bundle to use as the opponent")
     ap.add_argument("--as", dest="role", choices=ROLES, default="all")
     ap.add_argument("--rounds", type=int, default=10)
     ap.add_argument("--seed", type=int, default=1)
@@ -332,8 +365,16 @@ def main(argv=None) -> int:
 
     rng = random.Random(a.seed)
     world = _load_world()
-    you_gw, you_pr, you_deck, you_lineup = _load_side("you")
-    bot_gw, bot_pr, bot_deck, bot_lineup = _load_side(a.bot)
+    if a.you_bundle:
+        you_gw, you_pr, you_deck, you_lineup = _load_bundle_side(a.you_bundle)
+    else:
+        you_gw, you_pr, you_deck, you_lineup = _load_side("you")
+    if a.bot_bundle:
+        bot_gw, bot_pr, bot_deck, bot_lineup = _load_bundle_side(a.bot_bundle)
+        opponent_name = Path(a.bot_bundle).stem
+    else:
+        bot_gw, bot_pr, bot_deck, bot_lineup = _load_side(a.bot)
+        opponent_name = a.bot
 
     you_cards = {c["id"]: c for c in you_deck["cards"]}
     bot_cards = {c["id"]: c for c in bot_deck["cards"]}
@@ -344,7 +385,18 @@ def main(argv=None) -> int:
     log: list[dict] = []
     events_for_ui: list[dict] = []
 
-    print(f"\n  COLOSSEUM — spar vs {a.bot.upper()}  (seed {a.seed}, {a.rounds} rounds)")
+    def idle_exchange() -> dict:
+        return {
+            "damage": 0,
+            "recoil": 0,
+            "trace": [],
+            "verified": [],
+            "false": [],
+            "missed": [],
+            "credits_left": 100,
+        }
+
+    print(f"\n  COLOSSEUM — spar vs {opponent_name.upper()}  (seed {a.seed}, {a.rounds} rounds)")
     print(f"  {'-' * 66}")
 
     for r in range(1, a.rounds + 1):
@@ -352,8 +404,16 @@ def main(argv=None) -> int:
         bot_card = bot_cards[bot_lineup[(r - 1) % len(bot_lineup)]]
         you_card = you_cards[you_lineup[(r - 1) % len(you_lineup)]]
 
-        d_you = _exchange(a.bot, "you", you_gw, bot_pr, bot_card, world, r, rng, "learner:sv-0417")
-        d_bot = _exchange("you", a.bot, bot_gw, you_pr, you_card, world, r, rng, "learner:sv-0417")
+        d_you = (
+            _exchange(opponent_name, "you", you_gw, bot_pr, bot_card, world, r, rng, "learner:sv-0417")
+            if a.role in ("all", "defender")
+            else idle_exchange()
+        )
+        d_bot = (
+            _exchange("you", opponent_name, bot_gw, you_pr, you_card, world, r, rng, "learner:sv-0417")
+            if a.role in ("all", "prosecutor")
+            else idle_exchange()
+        )
 
         hp_you -= d_you["damage"] - 0  # damage they proved against you
         hp_you -= d_bot["recoil"]      # your false claims recoil onto you
@@ -365,7 +425,7 @@ def main(argv=None) -> int:
         # match state — the layering CONTRACTS.md 5 requires, so the ledger and the UI
         # never read the same event for different purposes.
         events_for_ui.append({"layer": 1, "type": "exchange_start", "side": "A",
-                              "round": r, "attacker": a.bot, "defender": "you",
+                              "round": r, "attacker": opponent_name, "defender": "you",
                               "card_id": bot_card.get("id"), "ask": bot_card.get("ask")})
         for e in d_you["trace"]:
             if e["type"] in ("command", "enforced", "tool_call", "mutation", "answer",
@@ -411,9 +471,9 @@ def main(argv=None) -> int:
                           "hp_a": hp_you, "hp_b": hp_bot, "rounds_played": len(log)})
     print(f"  {'-' * 66}")
     winner = "YOU" if hp_you > hp_bot else ("BOT" if hp_bot > hp_you else "DRAW")
-    print(f"  RESULT: {winner}   you {hp_you} — {hp_bot} {a.bot}")
+    print(f"  RESULT: {winner}   you {hp_you} — {hp_bot} {opponent_name}")
 
-    print(f"\n  ⚑ MISSED — detected in {a.bot}'s trace, never argued by your prosecutor:")
+    print(f"\n  MISSED — detected in {opponent_name}'s trace, never argued by your prosecutor:")
     if not all_missed:
         print("     (none — your prosecutor proved everything the referee could see)")
     else:
@@ -429,7 +489,7 @@ def main(argv=None) -> int:
             print("     ⚠ you went NEGATIVE — a disciplined round is ~9 cr against a 100 pool")
 
     if a.ui:
-        run_dir = HERE / "runs" / f"spar-{a.bot}-{a.seed}"
+        run_dir = HERE / "runs" / f"spar-{opponent_name}-{a.seed}"
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "summary.json").write_text(json.dumps(log, indent=1), encoding="utf8")
 
